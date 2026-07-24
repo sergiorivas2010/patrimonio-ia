@@ -1,117 +1,102 @@
 /**
- * LLM Chat Application Template
- *
- * A simple chat application using Cloudflare Workers AI.
- * This template demonstrates how to implement an LLM-powered chat interface with
- * streaming responses using Server-Sent Events (SSE).
- *
- * @license MIT
+ * Patrimonio IA — Cloudflare Worker
  */
 import { Env, ChatMessage } from "./types";
 
-// Model ID for Workers AI model
-// https://developers.cloudflare.com/workers-ai/models/
 const MODEL_ID = "@cf/meta/llama-3.1-8b-instruct-fp8";
+const ALLOWED_ORIGINS = new Set([
+  "https://sergiorivas2010.github.io",
+  "https://patrimonio-ia.sergiorivasrobles.workers.dev",
+]);
 
-// Default system prompt
-const SYSTEM_PROMPT = `´
+const SYSTEM_PROMPT = `
 Eres el Asesor Financiero de Patrimonio.
 
-Responde siempre en español de España.
+Responde siempre en español de España y utiliza euros (€).
+Ayuda al usuario a gestionar su dinero, comprender educación financiera y aprender a invertir con prudencia.
 
-Tu objetivo es ayudar al usuario a:
-- gestionar mejor su dinero;
-- aprender educación financiera;
-- aprender a invertir de forma responsable;
-- explicar conceptos de forma sencilla.
+Cuando recibas un bloque llamado CONTEXTO FINANCIERO ACTUAL DE LA APLICACIÓN:
+- úsalo como fuente principal para hablar de sus saldos, subcuentas, objetivos y movimientos;
+- no inventes cifras que no aparezcan en ese contexto;
+- distingue entre patrimonio total, dinero disponible y dinero apartado;
+- da explicaciones claras y adaptadas a una persona principiante;
+- no presentes una inversión como segura ni prometas rentabilidad;
+- recuerda que el usuario es menor de edad y que las decisiones financieras reales deben contar con la supervisión de sus padres o tutores.
 
-Usa siempre euros (€).
-
-No respondas en inglés salvo que el usuario lo pida expresamente.
-
-Si no sabes una respuesta, dilo claramente. No inventes información.
+Si no sabes algo o la información puede haber cambiado, dilo claramente.
 `;
 
+function corsHeaders(request: Request): Record<string, string> {
+  const origin = request.headers.get("Origin") || "";
+  const allowedOrigin = ALLOWED_ORIGINS.has(origin) ? origin : "https://sergiorivas2010.github.io";
+  return {
+    "Access-Control-Allow-Origin": allowedOrigin,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Vary": "Origin",
+  };
+}
+
 export default {
-	/**
-	 * Main request handler for the Worker
-	 */
-	async fetch(
-		request: Request,
-		env: Env,
-		ctx: ExecutionContext,
-	): Promise<Response> {
-		const url = new URL(request.url);
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
 
-		// Handle static assets (frontend)
-		if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
-			return env.ASSETS.fetch(request);
-		}
+    if (request.method === "OPTIONS" && url.pathname === "/api/chat") {
+      return new Response(null, { status: 204, headers: corsHeaders(request) });
+    }
 
-		// API Routes
-		if (url.pathname === "/api/chat") {
-			// Handle POST requests for chat
-			if (request.method === "POST") {
-				return handleChatRequest(request, env);
-			}
+    if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
+      return env.ASSETS.fetch(request);
+    }
 
-			// Method not allowed for other request types
-			return new Response("Method not allowed", { status: 405 });
-		}
+    if (url.pathname === "/api/chat") {
+      if (request.method !== "POST") {
+        return new Response("Method not allowed", {
+          status: 405,
+          headers: corsHeaders(request),
+        });
+      }
+      return handleChatRequest(request, env);
+    }
 
-		// Handle 404 for unmatched routes
-		return new Response("Not found", { status: 404 });
-	},
+    return new Response("Not found", { status: 404, headers: corsHeaders(request) });
+  },
 } satisfies ExportedHandler<Env>;
 
-/**
- * Handles chat API requests
- */
-async function handleChatRequest(
-	request: Request,
-	env: Env,
-): Promise<Response> {
-	try {
-		// Parse JSON request body
-		const { messages = [] } = (await request.json()) as {
-			messages: ChatMessage[];
-		};
+async function handleChatRequest(request: Request, env: Env): Promise<Response> {
+  try {
+    const { messages = [] } = (await request.json()) as { messages: ChatMessage[] };
+    const safeMessages = messages.slice(-14);
 
-		// Add system prompt if not present
-		if (!messages.some((msg) => msg.role === "system")) {
-			messages.unshift({ role: "system", content: SYSTEM_PROMPT });
-		}
+    if (!safeMessages.some((message) => message.role === "system")) {
+      safeMessages.unshift({ role: "system", content: SYSTEM_PROMPT });
+    }
 
-		const inputs = {
-			messages,
-			max_tokens: 1024,
-			stream: true,
-		} satisfies AiTextGenerationInput & { stream: true };
+    const stream = await env.AI.run(
+      MODEL_ID,
+      {
+        messages: safeMessages,
+        max_tokens: 1024,
+        stream: true,
+      } satisfies AiTextGenerationInput & { stream: true },
+    );
 
-		const stream = await env.AI.run<typeof MODEL_ID>(MODEL_ID, inputs, {
-			// Uncomment to use AI Gateway
-			// gateway: {
-			//   id: "YOUR_GATEWAY_ID", // Replace with your AI Gateway ID
-			//   skipCache: false,      // Set to true to bypass cache
-			//   cacheTtl: 3600,        // Cache time-to-live in seconds
-			// },
-		});
-
-		return new Response(stream, {
-			headers: {
-				"content-type": "text/event-stream; charset=utf-8",
-				"cache-control": "no-cache",
-				connection: "keep-alive",
-			},
-		});
-	} catch (error) {
-		console.error("Error processing chat request:", error);
-		return new Response(
-			JSON.stringify({ error: "Failed to process request" }),
-			{
-				status: 500,
-				headers: { "content-type": "application/json" },
-			},
-		);
-	}
+    return new Response(stream, {
+      headers: {
+        ...corsHeaders(request),
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+      },
+    });
+  } catch (error) {
+    console.error("Error processing chat request:", error);
+    return new Response(JSON.stringify({ error: "No se pudo procesar la solicitud" }), {
+      status: 500,
+      headers: {
+        ...corsHeaders(request),
+        "Content-Type": "application/json; charset=utf-8",
+      },
+    });
+  }
 }
